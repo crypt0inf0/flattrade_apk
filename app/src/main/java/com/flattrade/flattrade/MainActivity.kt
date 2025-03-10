@@ -113,8 +113,8 @@ class MainActivity : AppCompatActivity() {
         registerReceiver(broadcastReceiver, IntentFilter("com.example.flattradeapp.LOG"))
         registerReceiver(broadcastReceiver, IntentFilter("com.example.flattradeapp.STATUS"))
 
-        // Optionally, start the service immediately
-        startService(Intent(this, WebSocketService::class.java))
+        // Do not auto-start the WebSocket service here;
+        // it will only start when the "Start Connection" button is tapped.
     }
 
     override fun onDestroy() {

@@ -16,6 +16,18 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
+// Data class to track order fills (if needed)
+data class OrderInfo(
+    val symbol: String,
+    val exchange: String,
+    val productCode: String,
+    val totalQty: Int,
+    var filledQty: Int,
+    var soldQty: Int,
+    val processedFills: MutableSet<String>,
+    var price: Float
+)
+
 class WebSocketService : Service() {
 
     companion object {
@@ -34,16 +46,23 @@ class WebSocketService : Service() {
     private val scope = CoroutineScope(Dispatchers.IO)
 
     // Authentication details and target value – loaded from SharedPreferences
-    private val authorizationUid = "FZ0xxxx"
-    private val authorizationActid = "FZ0xxxx"
+    private val authorizationUid = "FZ0xxxx"  // Update with your actual UID
+    private val authorizationActid = "FZ0xxxx"  // Update with your actual ActID
     private var authorizationSusertoken: String = ""
     private var targetValue: Float = 0.0f
-    private val appInstId = "0978-408e-b3de9e1210f2"
+    private val appInstId = "29db902d-0978-408e-9c37-b3de9e1210f2"
+
+    // Order tracker map
+    private val orderTracker = mutableMapOf<String, OrderInfo>()
 
     override fun onCreate() {
         super.onCreate()
         isServiceRunning = true
-        // No foreground notification used now (for API 28 it should run, but note newer Android versions may restrict background services)
+
+        // Create and start the foreground notification
+        createNotificationChannel()
+        startForeground(1, createNotification("Connecting to WebSocket..."))
+
         // Load token and target value from SharedPreferences
         val prefs = getSharedPreferences("AppPrefs", Context.MODE_PRIVATE)
         authorizationSusertoken = prefs.getString("authorizationSusertoken", "") ?: ""
@@ -69,6 +88,32 @@ class WebSocketService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    private fun createNotification(content: String): Notification {
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("WebSocket Service")
+            .setContentText(content)
+            .setSmallIcon(R.drawable.ic_launcher_foreground) // Replace with your own icon if needed
+            .build()
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "WebSocket Service Channel",
+                NotificationManager.IMPORTANCE_LOW
+            )
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun updateNotification(content: String) {
+        val notification = createNotification(content)
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.notify(1, notification)
+    }
+
     private fun connectWebSocket() {
         val request = Request.Builder()
             .url("wss://web.flattrade.in/NorenWSWeb/")
@@ -89,10 +134,10 @@ class WebSocketService : Service() {
                     put("susertoken", authorizationSusertoken)
                     put("source", "WEB")
                 }
-                // Send authentication data and log it
                 webSocket.send(authData.toString())
                 sendLog("Sent authData: ${authData.toString()}")
                 sendStatus("CONNECTED")
+                updateNotification("Connected to WebSocket")
                 startHeartbeat()
             }
 
@@ -101,25 +146,49 @@ class WebSocketService : Service() {
                     val data = JSONObject(text)
                     sendLog("Received: $text")
 
-                    // Check for order conditions
+                    // Check for buy order fill messages (reporttype == "Fill")
                     if (data.optString("t") == "om" &&
                         (data.optString("pcode") == "M" || data.optString("pcode") == "I") &&
                         data.optString("trantype") == "B" &&
-                        data.optString("status") == "REJECTED") {
+                        data.optString("reporttype") == "Fill") {
 
-                        sendLog("Filtered Order Data: $text")
+                        val orderId = data.optString("norenordno")
+                        val fillId = data.optString("flid")
+                        val fillQty = data.optString("flqty").toIntOrNull() ?: 0
+                        val fillPrice = data.optString("flprc").toFloatOrNull() ?: 0f
 
-                        // Calculate new price using dynamic targetValue
-                        val price = (data.optString("prc", "0").toFloat() + targetValue).toString()
-                        sendLog("New price for order: $price")
+                        // Initialize order tracking if this is the first fill for this order
+                        if (!orderTracker.containsKey(orderId)) {
+                            orderTracker[orderId] = OrderInfo(
+                                symbol = data.optString("tsym"),
+                                exchange = data.optString("exch"),
+                                productCode = data.optString("pcode"),
+                                totalQty = data.optString("qty").toIntOrNull() ?: 0,
+                                filledQty = 0,
+                                soldQty = 0,
+                                processedFills = mutableSetOf(),
+                                price = fillPrice
+                            )
+                        }
+                        val orderInfo = orderTracker[orderId]!!
+                        if (!orderInfo.processedFills.contains(fillId)) {
+                            orderInfo.processedFills.add(fillId)
+                            orderInfo.filledQty += fillQty
 
-                        placeOrder(
-                            data.optString("exch"),
-                            data.optString("pcode"),
-                            price,
-                            data.optString("qty"),
-                            data.optString("tsym")
-                        )
+                            // Calculate sell order: sell this fill only, price is fillPrice + 0.05
+                            val sellQty = fillQty
+                            val sellPrice = String.format("%.2f", fillPrice + 0.05f)
+                            sendLog("Placing sell order for $sellQty contracts at $sellPrice")
+
+                            placeOrder(
+                                data.optString("exch"),
+                                data.optString("pcode"),
+                                sellPrice,
+                                sellQty.toString(),
+                                data.optString("tsym")
+                            )
+                            orderInfo.soldQty += sellQty
+                        }
                     }
                 } catch (e: Exception) {
                     sendLog("Error parsing message: ${e.message}")
@@ -131,6 +200,7 @@ class WebSocketService : Service() {
                 stopHeartbeat()
                 sendLog("WebSocket failure: ${t.message}")
                 sendStatus("DISCONNECTED")
+                updateNotification("Disconnected from WebSocket")
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
@@ -138,6 +208,7 @@ class WebSocketService : Service() {
                 stopHeartbeat()
                 sendLog("WebSocket closed: Code $code, Reason: $reason")
                 sendStatus("DISCONNECTED")
+                updateNotification("Disconnected from WebSocket")
             }
         }
 
@@ -166,7 +237,7 @@ class WebSocketService : Service() {
         heartbeatJob = null
     }
 
-    // Place order function – sends an HTTP POST to place an order
+    // Place order function – sends an HTTP POST request to place a sell order
     private fun placeOrder(
         exSeg: String,
         exProd: String,
@@ -194,19 +265,15 @@ class WebSocketService : Service() {
                     put("app_inst_id", appInstId)
                     put("ordersource", "WEB")
                 }
-
                 val jData = orderData.toString()
                 sendLog("Order data: $jData")
-
                 val requestBody = "jData=$jData&jKey=$authorizationSusertoken"
                     .toRequestBody("application/x-www-form-urlencoded".toMediaType())
-
                 val request = Request.Builder()
                     .url(requestUrl)
                     .post(requestBody)
                     .header("Content-Type", "application/x-www-form-urlencoded")
                     .build()
-
                 withContext(Dispatchers.IO) {
                     client.newCall(request).execute().use { response ->
                         val responseBody = response.body?.string() ?: ""
@@ -223,14 +290,14 @@ class WebSocketService : Service() {
         }
     }
 
-    // Helper function to broadcast log messages to the UI
+    // Helper function to broadcast log messages to MainActivity
     private fun sendLog(message: String) {
         val intent = Intent("com.example.flattradeapp.LOG")
         intent.putExtra("log_message", message)
         sendBroadcast(intent)
     }
 
-    // Helper function to broadcast status updates to the UI
+    // Helper function to broadcast status updates to MainActivity
     private fun sendStatus(status: String) {
         val intent = Intent("com.example.flattradeapp.STATUS")
         intent.putExtra("status_update", status)
